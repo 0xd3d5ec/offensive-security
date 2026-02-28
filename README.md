@@ -29,6 +29,39 @@ python3 pwsh-reverseshell.py 192.168.1.10 4444
 
 ---
 
+### `PowerCrack.ps1`
+
+**Description:** A comprehensive PowerShell reconnaissance script for local and Active Directory environments, designed for penetration testing engagements. Performs local system enumeration (system info, users, network config, running processes/services, installed software, PowerShell history, sensitive file discovery) and full Active Directory reconnaissance (domain/forest info, domain admins, computer objects, GPOs, Kerberoastable and AS-REP roastable users, domain trusts, delegation misconfigrations, GPP passwords, and ACL analysis). Also supports BloodHound data collection via SharpHound.
+
+**Usage:**
+```powershell
+.\PowerCrack.ps1 [options]
+```
+
+**Parameters:**
+
+| Parameter | Description |
+|-----------|-------------|
+| `-OutputFile <path>` | File path to write output to |
+| `-Format <Text\|JSON>` | Output format — `Text` (default) or `JSON` |
+| `-Verbose` | Enable verbose output showing which checks are running |
+| `-BloodHound` | Run BloodHound data collection via SharpHound instead of standard recon |
+| `-Help` | Display the help message and exit |
+
+**Examples:**
+```powershell
+# Run full recon and save output as JSON
+.\PowerCrack.ps1 -Format JSON -OutputFile C:\temp\recon.json
+
+# Run with verbose output (text transcript saved to file)
+.\PowerCrack.ps1 -Verbose -OutputFile C:\temp\recon.txt
+
+# Run BloodHound data collection
+.\PowerCrack.ps1 -BloodHound
+```
+
+---
+
 ### `kratos.sh`
 
 **Description:** Kalix Script — an automated Linux environment setup tool for Debian/Kali-based systems. Installs core packages, configures Zsh with Oh-My-Zsh (Kali-like theme, autosuggestions, syntax highlighting), sets up tmux with sane defaults, and optionally changes the default shell. Supports multiple package profiles and a dry-run mode for safe previewing.
