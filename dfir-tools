@@ -1,0 +1,301 @@
+#!/usr/bin/env bash
+#
+# dfir-toolkit.sh - Install and update an offline DFIR toolkit on Debian
+#
+# Target: Debian 12/13 x86_64 analysis VM used to examine a mounted,
+#         read-only Windows disk. Run install + update while online,
+#         then disconnect the VM before attaching evidence.
+#
+# Usage:
+#   ./dfir-toolkit.sh install     # full install (run once, online)
+#   ./dfir-toolkit.sh update      # refresh all rules/signatures (online)
+#   ./dfir-toolkit.sh verify      # confirm every tool runs (works offline)
+#
+set -euo pipefail
+
+DFIR_ROOT="${DFIR_ROOT:-/opt/dfir}"
+EZ_TOOLS=(RECmd AmcacheParser AppCompatCacheParser PECmd MFTECmd
+          EvtxECmd SrumECmd LECmd JLECmd SBECmd RecentFileCacheParser)
+
+log()  { printf '\033[1;32m[+]\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[1;31m[-]\033[0m %s\n' "$*" >&2; exit 1; }
+
+need_root() {
+    [ "$(id -u)" -eq 0 ] || die "Run with sudo."
+}
+
+# Resolve a GitHub release asset URL by substring match, preferring musl.
+gh_asset() {
+    local repo="$1" want="$2" url
+    url=$(curl -fsSL "https://api.github.com/repos/${repo}/releases/latest" \
+        | grep -oP '"browser_download_url":\s*"\K[^"]+' \
+        | grep -i -- "$want" \
+        | sort -r | head -n1) || true
+    [ -n "$url" ] || die "No release asset matching '${want}' in ${repo}"
+    printf '%s\n' "$url"
+}
+
+# ---------------------------------------------------------------- base
+
+install_base() {
+    log "Installing base packages"
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        build-essential pkg-config cmake git curl wget unzip p7zip-full jq \
+        ca-certificates python3 python3-pip python3-venv pipx \
+        perl libparse-win32registry-perl libdatetime-perl \
+        ntfs-3g ewf-tools sleuthkit qemu-utils yara libicu-dev
+    mkdir -p "$DFIR_ROOT" "$DFIR_ROOT/bin"
+}
+
+# ---------------------------------------------------------------- Loki-RS
+
+install_loki() {
+    log "Installing Rust toolchain and building Loki-RS"
+    if ! command -v cargo >/dev/null 2>&1; then
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    fi
+    # shellcheck source=/dev/null
+    . "$HOME/.cargo/env"
+
+    if [ -d "$DFIR_ROOT/Loki-RS/.git" ]; then
+        git -C "$DFIR_ROOT/Loki-RS" pull --ff-only
+    else
+        git clone https://github.com/Neo23x0/Loki-RS.git "$DFIR_ROOT/Loki-RS"
+    fi
+    ( cd "$DFIR_ROOT/Loki-RS" && cargo build --release )
+    ln -sf "$DFIR_ROOT/Loki-RS/target/release/loki"      "$DFIR_ROOT/bin/loki"
+    ln -sf "$DFIR_ROOT/Loki-RS/target/release/loki-util" "$DFIR_ROOT/bin/loki-util"
+}
+
+update_loki() {
+    log "Updating Loki-RS signatures (YARA Forge Core)"
+    ( cd "$DFIR_ROOT/Loki-RS" && ./target/release/loki-util update )
+}
+
+# ---------------------------------------------------------------- Chainsaw
+
+install_chainsaw() {
+    log "Installing Chainsaw"
+    local url
+    url=$(gh_asset "WithSecureLabs/chainsaw" "all_platforms")
+    rm -rf "$DFIR_ROOT/chainsaw" && mkdir -p "$DFIR_ROOT/chainsaw"
+    curl -fsSL "$url" -o /tmp/chainsaw.zip
+    unzip -qo /tmp/chainsaw.zip -d "$DFIR_ROOT/chainsaw"
+    rm -f /tmp/chainsaw.zip
+    # Archive layout nests one level; flatten and locate the linux binary.
+    local bin
+    bin=$(find "$DFIR_ROOT/chainsaw" -type f -name 'chainsaw_x86_64-unknown-linux-gnu*' \
+        | head -n1)
+    [ -n "$bin" ] || die "Chainsaw linux binary not found in archive"
+    chmod +x "$bin"
+    ln -sf "$bin" "$DFIR_ROOT/bin/chainsaw"
+}
+
+update_chainsaw() {
+    log "Updating Sigma rule repository for Chainsaw"
+    if [ -d "$DFIR_ROOT/sigma/.git" ]; then
+        git -C "$DFIR_ROOT/sigma" pull --ff-only
+    else
+        git clone --depth 1 https://github.com/SigmaHQ/sigma.git "$DFIR_ROOT/sigma"
+    fi
+    log "Chainsaw's own rules ship in the release - re-run install to refresh"
+}
+
+# ---------------------------------------------------------------- Hayabusa
+
+install_hayabusa() {
+    log "Installing Hayabusa"
+    local url
+    url=$(gh_asset "Yamato-Security/hayabusa" "lin-x64-gnu")
+    rm -rf "$DFIR_ROOT/hayabusa" && mkdir -p "$DFIR_ROOT/hayabusa"
+    curl -fsSL "$url" -o /tmp/hayabusa.zip
+    unzip -qo /tmp/hayabusa.zip -d "$DFIR_ROOT/hayabusa"
+    rm -f /tmp/hayabusa.zip
+    local bin
+    bin=$(find "$DFIR_ROOT/hayabusa" -maxdepth 2 -type f -name 'hayabusa*' \
+        ! -name '*.zip' | head -n1)
+    [ -n "$bin" ] || die "Hayabusa binary not found in archive"
+    chmod +x "$bin"
+    ln -sf "$bin" "$DFIR_ROOT/bin/hayabusa"
+}
+
+update_hayabusa() {
+    log "Updating Hayabusa rules"
+    ( cd "$DFIR_ROOT/hayabusa" && ./"$(basename "$(readlink -f "$DFIR_ROOT/bin/hayabusa")")" update-rules )
+}
+
+# ---------------------------------------------------------------- RegRipper
+
+install_regripper() {
+    log "Installing RegRipper"
+    if [ -d "$DFIR_ROOT/RegRipper3.0/.git" ]; then
+        git -C "$DFIR_ROOT/RegRipper3.0" pull --ff-only
+    else
+        git clone https://github.com/keydet89/RegRipper3.0.git \
+            "$DFIR_ROOT/RegRipper3.0"
+    fi
+    chmod +x "$DFIR_ROOT/RegRipper3.0/rip.pl"
+    ln -sf "$DFIR_ROOT/RegRipper3.0/rip.pl" "$DFIR_ROOT/bin/rip.pl"
+}
+
+update_regripper() {
+    log "Updating RegRipper plugins"
+    git -C "$DFIR_ROOT/RegRipper3.0" pull --ff-only
+}
+
+# ---------------------------------------------------------------- Python tools
+
+install_python_tools() {
+    log "Installing regipy and WMI persistence tooling"
+    python3 -m venv "$DFIR_ROOT/venv"
+    "$DFIR_ROOT/venv/bin/pip" install --upgrade pip
+    "$DFIR_ROOT/venv/bin/pip" install regipy python-registry libesedb-python
+    ln -sf "$DFIR_ROOT/venv/bin/regipy-plugins-run" "$DFIR_ROOT/bin/regipy-plugins-run"
+    ln -sf "$DFIR_ROOT/venv/bin/registry-plugins-run" "$DFIR_ROOT/bin/registry-plugins-run" 2>/dev/null || true
+
+    if [ -d "$DFIR_ROOT/WMI_Forensics/.git" ]; then
+        git -C "$DFIR_ROOT/WMI_Forensics" pull --ff-only
+    else
+        git clone https://github.com/davidpany/WMI_Forensics.git \
+            "$DFIR_ROOT/WMI_Forensics"
+    fi
+}
+
+update_python_tools() {
+    log "Updating Python tooling"
+    "$DFIR_ROOT/venv/bin/pip" install --upgrade regipy python-registry
+    git -C "$DFIR_ROOT/WMI_Forensics" pull --ff-only
+}
+
+# ---------------------------------------------------------------- EZ Tools
+
+install_eztools() {
+    log "Installing .NET runtime"
+    if ! command -v dotnet >/dev/null 2>&1; then
+        curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh
+        chmod +x /tmp/dotnet-install.sh
+        /tmp/dotnet-install.sh --channel 9.0 --runtime dotnet \
+            --install-dir /usr/share/dotnet
+        ln -sf /usr/share/dotnet/dotnet /usr/local/bin/dotnet
+        rm -f /tmp/dotnet-install.sh
+    fi
+
+    log "Downloading Eric Zimmerman tools (net9)"
+    mkdir -p "$DFIR_ROOT/ez"
+    local t
+    for t in "${EZ_TOOLS[@]}"; do
+        if curl -fsSL "https://download.ericzimmermanstools.com/net9/${t}.zip" \
+             -o "/tmp/${t}.zip"; then
+            unzip -qo "/tmp/${t}.zip" -d "$DFIR_ROOT/ez/${t}"
+            rm -f "/tmp/${t}.zip"
+            log "  fetched ${t}"
+        else
+            warn "  ${t} download failed - check name at ericzimmerman.github.io"
+        fi
+    done
+    write_ez_wrappers
+}
+
+write_ez_wrappers() {
+    local t dll
+    for t in "${EZ_TOOLS[@]}"; do
+        dll=$(find "$DFIR_ROOT/ez/${t}" -maxdepth 2 -name "${t}.dll" | head -n1)
+        [ -n "$dll" ] || continue
+        cat > "$DFIR_ROOT/bin/${t}" <<EOF
+#!/usr/bin/env bash
+exec dotnet "${dll}" "\$@"
+EOF
+        chmod +x "$DFIR_ROOT/bin/${t}"
+    done
+}
+
+update_eztools() {
+    log "Re-downloading EZ Tools (they have no self-update on Linux)"
+    install_eztools
+}
+
+# ---------------------------------------------------------------- shell env
+
+write_profile() {
+    cat > /etc/profile.d/dfir.sh <<EOF
+export DFIR_ROOT="${DFIR_ROOT}"
+export PATH="\${DFIR_ROOT}/bin:\${PATH}"
+EOF
+    chmod 0644 /etc/profile.d/dfir.sh
+    log "Added ${DFIR_ROOT}/bin to PATH (new shells)"
+}
+
+# ---------------------------------------------------------------- verify
+
+verify() {
+    local ok=0 fail=0 t
+    for t in loki chainsaw hayabusa rip.pl; do
+        if "$DFIR_ROOT/bin/$t" --help >/dev/null 2>&1 \
+           || "$DFIR_ROOT/bin/$t" -h >/dev/null 2>&1; then
+            log "OK   $t"; ok=$((ok + 1))
+        else
+            warn "FAIL $t"; fail=$((fail + 1))
+        fi
+    done
+    for t in "${EZ_TOOLS[@]}"; do
+        [ -x "$DFIR_ROOT/bin/$t" ] || continue
+        if "$DFIR_ROOT/bin/$t" --help >/dev/null 2>&1; then
+            log "OK   $t"; ok=$((ok + 1))
+        else
+            warn "FAIL $t"; fail=$((fail + 1))
+        fi
+    done
+    if [ -d "$DFIR_ROOT/Loki-RS/signatures" ]; then
+        log "OK   Loki signatures present"
+    else
+        warn "FAIL Loki signatures missing - run: $0 update"
+    fi
+    printf '\n%d passed, %d failed\n' "$ok" "$fail"
+    [ "$fail" -eq 0 ] || exit 1
+}
+
+# ---------------------------------------------------------------- main
+
+case "${1:-}" in
+    install)
+        need_root
+        install_base
+        install_loki
+        install_chainsaw
+        install_hayabusa
+        install_regripper
+        install_python_tools
+        install_eztools
+        write_profile
+        update_loki
+        update_chainsaw
+        update_hayabusa
+        log "Install complete. Open a new shell, then run: $0 verify"
+        ;;
+    update)
+        need_root
+        update_loki
+        update_chainsaw
+        update_hayabusa
+        update_regripper
+        update_python_tools
+        update_eztools
+        log "Update complete."
+        ;;
+    verify)
+        verify
+        ;;
+    *)
+        cat >&2 <<EOF
+Usage: $0 {install|update|verify}
+
+  install   Full toolkit install. Requires internet and root.
+  update    Refresh signatures, Sigma rules, plugins. Requires internet.
+  verify    Smoke-test every tool. Works offline - run this last,
+            immediately before disconnecting the VM.
+EOF
+        exit 1
+        ;;
+esac
